@@ -9,7 +9,7 @@
 기존 명령의 앞부분만 바꾸면 됩니다.
 
 ```bat
-sfinder-openfill.bat setup --tetfu v115@zgTpwhBeWpCeWpAewhXpBeXpBeTpJeAgH --patterns *p7 --fill i --margin o
+sfinder-openfill.bat setup --tetfu v115@zgTpwhBeWpCeWpAewhXpBeXpBeTpJeAgH --patterns *p7 --fill i --margin o --split yes
 ```
 
 `starter`에서 더블클릭하려면:
@@ -23,4 +23,5 @@ starter\run-setup-openfill.bat
 - `sfinder.jar`
 - `sfinder-openfill.bat`
 - `openfill-rule\sfinder-openfill-rule.jar`
+- `openfill-rule\keep-main-solutions.py`
 - `starter\run-setup-openfill.bat`
