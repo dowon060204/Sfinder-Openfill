@@ -1,145 +1,136 @@
 #!/usr/bin/env python3
-"""Build a companion JAR that relaxes sfinder setup fill sub-solution checks.
+"""Build the openfill companion JAR for solution-finder v1.40.
 
-The original sfinder.jar is not modified.  This script extracts
-entry/setup/SetupEntryPoint.class, patches the private lambda used by
-getResults so fill-only pack results are not discarded before the later full
-setup build check, and writes a small override JAR.
+The original sfinder.jar is not modified.  This script recompiles only
+entry.setup.SetupEntryPoint from the v1.40 source with two small rule changes:
+
+1. keep fill pack candidates even when they cannot be built by themselves;
+2. when order mode needs sub-solution search, stop after the first valid
+   sub-solution for each main solution.
 """
 
 from __future__ import annotations
 
 import argparse
-import struct
+import shutil
+import subprocess
 import sys
+import tempfile
+import urllib.request
 import zipfile
 from pathlib import Path
 
 
-CLASS_NAME = "entry/setup/SetupEntryPoint.class"
-TARGET_METHOD = "lambda$getResults$13"
+SOURCE_URL = (
+    "https://raw.githubusercontent.com/knewjade/solution-finder/"
+    "v1.40/src/main/java/entry/setup/SetupEntryPoint.java"
+)
 OUTPUT_NAME = "sfinder-openfill-rule.jar"
+SOURCE_PATH = Path("entry/setup/SetupEntryPoint.java")
 
 
-def read_u1(data: bytes | bytearray, offset: int) -> tuple[int, int]:
-    return data[offset], offset + 1
+LOCAL_SEARCH_METHOD = """\
+    private Stream<? extends List<MinoOperationWithKey>> localSearch(List<MinoOperationWithKey> operationWithKeys, Field field, LinkedList<Piece> pieces, EnumMap<Piece, List<FieldOperationWithKey>> minoEachPieceMap, int maxHeight, ThreadLocal<BuildUpStream> buildUpStreamThreadLocal, Field initField, Piece prev, int prevUsingIndex) {
+        Piece piece = pieces.pollFirst();
+        try {
+            List<FieldOperationWithKey> minos = minoEachPieceMap.get(piece);
+            int startIndex = prev == piece ? prevUsingIndex + 1 : 0;
+
+            for (int index = startIndex; index < minos.size(); index++) {
+                FieldOperationWithKey fieldOperationWithKey = minos.get(index);
+                Field minoField = fieldOperationWithKey.getField();
+                if (field.canMerge(minoField)) {
+                    LinkedList<MinoOperationWithKey> newOperations = new LinkedList<>(operationWithKeys);
+                    newOperations.add(fieldOperationWithKey.getOperation());
+
+                    if (pieces.isEmpty()) {
+                        BuildUpStream buildUpStream = buildUpStreamThreadLocal.get();
+                        Optional<List<MinoOperationWithKey>> result = buildUpStream.existsValidBuildPattern(initField, newOperations).findFirst();
+                        if (result.isPresent()) {
+                            return Stream.of(result.get());
+                        }
+                    } else {
+                        Field freeze = field.freeze(maxHeight);
+                        freeze.merge(minoField);
+
+                        Optional<? extends List<MinoOperationWithKey>> result = localSearch(newOperations, freeze, pieces, minoEachPieceMap, maxHeight, buildUpStreamThreadLocal, initField, piece, index).findFirst();
+                        if (result.isPresent()) {
+                            return Stream.of(result.get());
+                        }
+                    }
+                }
+            }
+
+            return Stream.empty();
+        } finally {
+            pieces.addFirst(piece);
+        }
+    }
+"""
 
 
-def read_u2(data: bytes | bytearray, offset: int) -> tuple[int, int]:
-    return struct.unpack_from(">H", data, offset)[0], offset + 2
+def download_source() -> str:
+    with urllib.request.urlopen(SOURCE_URL, timeout=30) as response:
+        return response.read().decode("utf-8")
 
 
-def read_u4(data: bytes | bytearray, offset: int) -> tuple[int, int]:
-    return struct.unpack_from(">I", data, offset)[0], offset + 4
+def patch_source(source: str) -> str:
+    source = source.replace(
+        "return !sampleOperations.isEmpty();",
+        "return true;",
+        1,
+    )
+
+    source = source.replace(
+        ".flatMap(blocks -> localSearch(operationWithKeys, field, blocks, minoEachPieceMap, maxHeight, buildUpStreamThreadLocal, initField, null, 0));",
+        ".flatMap(blocks -> localSearch(operationWithKeys, field, blocks, minoEachPieceMap, maxHeight, buildUpStreamThreadLocal, initField, null, 0))\n"
+        "                        .limit(1);",
+        1,
+    )
+
+    start = source.index("    private Stream<? extends List<MinoOperationWithKey>> localSearch(")
+    end = source.index("    private SetupFunctions createSetupFunctions", start)
+    source = source[:start] + LOCAL_SEARCH_METHOD + source[end:]
+
+    return source
 
 
-def skip_member(data: bytes | bytearray, offset: int) -> int:
-    offset += 6
-    attributes_count, offset = read_u2(data, offset)
-    for _ in range(attributes_count):
-        offset += 2
-        length, offset = read_u4(data, offset)
-        offset += length
-    return offset
+def compile_source(source: str, sfinder_jar: Path, output_jar: Path) -> None:
+    javac = shutil.which("javac")
+    if javac is None:
+        raise RuntimeError("javac was not found on PATH")
+
+    with tempfile.TemporaryDirectory(prefix="sfinder-openfill-") as tmp:
+        tmp_path = Path(tmp)
+        src_file = tmp_path / "src" / SOURCE_PATH
+        classes_dir = tmp_path / "classes"
+        src_file.parent.mkdir(parents=True)
+        classes_dir.mkdir()
+        src_file.write_text(source, encoding="utf-8", newline="\n")
+
+        command = [
+            javac,
+            "--release",
+            "8",
+            "-encoding",
+            "UTF-8",
+            "-cp",
+            str(sfinder_jar),
+            "-d",
+            str(classes_dir),
+            str(src_file),
+        ]
+        subprocess.run(command, check=True)
+
+        output_jar.parent.mkdir(parents=True, exist_ok=True)
+        with zipfile.ZipFile(output_jar, "w", compression=zipfile.ZIP_DEFLATED) as target:
+            for class_file in sorted((classes_dir / "entry" / "setup").glob("SetupEntryPoint*.class")):
+                target.write(class_file, class_file.relative_to(classes_dir).as_posix())
 
 
-def parse_constant_pool(data: bytes | bytearray) -> tuple[list[str | None], int]:
-    magic, offset = read_u4(data, 0)
-    if magic != 0xCAFEBABE:
-        raise ValueError("not a Java class file")
-
-    offset += 4
-    cp_count, offset = read_u2(data, offset)
-    utf8: list[str | None] = [None] * cp_count
-    index = 1
-
-    while index < cp_count:
-        tag, offset = read_u1(data, offset)
-        if tag == 1:
-            length, offset = read_u2(data, offset)
-            raw = bytes(data[offset : offset + length])
-            utf8[index] = raw.decode("utf-8")
-            offset += length
-        elif tag in (3, 4):
-            offset += 4
-        elif tag in (5, 6):
-            offset += 8
-            index += 1
-        elif tag in (7, 8, 16, 19, 20):
-            offset += 2
-        elif tag in (9, 10, 11, 12, 17, 18):
-            offset += 4
-        elif tag == 15:
-            offset += 3
-        else:
-            raise ValueError(f"unsupported constant-pool tag {tag} at #{index}")
-        index += 1
-
-    return utf8, offset
-
-
-def patch_setup_entrypoint(class_bytes: bytes) -> bytes:
-    data = bytearray(class_bytes)
-    utf8, offset = parse_constant_pool(data)
-
-    offset += 6
-    interfaces_count, offset = read_u2(data, offset)
-    offset += interfaces_count * 2
-
-    fields_count, offset = read_u2(data, offset)
-    for _ in range(fields_count):
-        offset = skip_member(data, offset)
-
-    methods_count, offset = read_u2(data, offset)
-    patched = False
-
-    for _ in range(methods_count):
-        offset += 2
-        name_index, offset = read_u2(data, offset)
-        offset += 2
-        attributes_count, offset = read_u2(data, offset)
-        method_name = utf8[name_index]
-
-        for _ in range(attributes_count):
-            attr_name_index, offset = read_u2(data, offset)
-            attr_length, offset = read_u4(data, offset)
-            attr_name = utf8[attr_name_index]
-
-            if method_name == TARGET_METHOD and attr_name == "Code":
-                attr_header_offset = offset - 6
-                attr_end = offset + attr_length
-                max_locals = struct.unpack_from(">H", data, offset + 2)[0]
-                new_code = b"\x04\xAC"  # iconst_1; ireturn
-                new_payload = (
-                    struct.pack(">H", 1)
-                    + struct.pack(">H", max_locals)
-                    + struct.pack(">I", len(new_code))
-                    + new_code
-                    + struct.pack(">H", 0)
-                    + struct.pack(">H", 0)
-                )
-                new_attribute = (
-                    struct.pack(">H", attr_name_index)
-                    + struct.pack(">I", len(new_payload))
-                    + new_payload
-                )
-                return bytes(data[:attr_header_offset] + new_attribute + data[attr_end:])
-
-            offset += attr_length
-
-    if not patched:
-        raise ValueError(f"could not find {TARGET_METHOD} Code attribute")
-    return bytes(data)
-
-
-def build(original_jar: Path, output_jar: Path) -> None:
-    with zipfile.ZipFile(original_jar, "r") as source:
-        class_bytes = source.read(CLASS_NAME)
-
-    patched = patch_setup_entrypoint(class_bytes)
-
-    with zipfile.ZipFile(output_jar, "w", compression=zipfile.ZIP_DEFLATED) as target:
-        target.writestr(CLASS_NAME, patched)
+def build(sfinder_jar: Path, output_jar: Path) -> None:
+    source = patch_source(download_source())
+    compile_source(source, sfinder_jar, output_jar)
 
 
 def main() -> int:
@@ -162,7 +153,6 @@ def main() -> int:
         print(f"sfinder.jar not found: {args.sfinder}", file=sys.stderr)
         return 2
 
-    args.output.parent.mkdir(parents=True, exist_ok=True)
     build(args.sfinder, args.output)
     print(f"wrote {args.output}")
     return 0
